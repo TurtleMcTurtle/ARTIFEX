@@ -125,6 +125,13 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	if !exists || current != t || s.engine.IsDeleting(t.ID) {
 		return false, locale.Errorf("task is being deleted")
 	}
+	var cancelled bool
+	if err := s.m.pg.QueryRow(`SELECT cancel_requested_at IS NOT NULL FROM tasks WHERE id=$1`, t.ID).Scan(&cancelled); err != nil {
+		return false, locale.Errorf("Task admission storage unavailable")
+	}
+	if cancelled {
+		return false, locale.Errorf("Cancelled tasks cannot be resumed")
+	}
 	if !s.engine.beginTaskOperation(t.ID) {
 		return false, locale.Errorf("task is being deleted")
 	}

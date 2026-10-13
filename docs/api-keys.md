@@ -1,5 +1,12 @@
 # Task integration API keys
 
+**Integration extensions:** see [Skynet integration contract](skynet-integration.md)
+for idempotent submissions, exact target metadata/asset allow rules, scoped
+findings/report reads and cancellation. The endpoint table below describes the
+original baseline; the extension contract supersedes its denied findings/control
+statement only for the explicitly named task-scoped endpoints. No admin access
+is granted and network-egress scope enforcement is not provided.
+
 ARTIFEX currently has one administrator identity: the fixed `ARTIFEX` login and
 JWT subject. There is no user registry or multiuser login. Keys are bound to this
 verified JWT subject, not to a caller-supplied owner. This feature does **not**

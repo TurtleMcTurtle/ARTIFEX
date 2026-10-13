@@ -561,6 +561,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS owner TEXT NOT NULL DEFAULT 'ARTIFEX' CHECK (owner <> '');
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS integration_scope JSONB NOT NULL DEFAULT 'null';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cancel_requested_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS task_submissions (
+    owner TEXT NOT NULL,
+    external_request_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY(owner, external_request_id)
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_alive  ON tasks(created_at DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)          WHERE deleted_at IS NULL;

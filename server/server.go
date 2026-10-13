@@ -711,6 +711,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/api-keys", s.listAPIKeys)
 	mux.HandleFunc("DELETE /api/api-keys/{id}", s.revokeAPIKey)
 	mux.HandleFunc("GET /api/tasks/{id}/status", s.taskStatusAPI)
+	mux.HandleFunc("GET /api/tasks/{id}/findings", s.integrationFindings)
+	mux.HandleFunc("GET /api/tasks/{id}/findings/{fid}", s.integrationFinding)
+	mux.HandleFunc("GET /api/tasks/{id}/report", s.integrationReport)
+	mux.HandleFunc("POST /api/tasks/{id}/cancel", s.integrationCancel)
 	mux.HandleFunc("GET /api/tasks", s.listTasks)
 	mux.HandleFunc("POST /api/tasks", s.createTask)
 	mux.HandleFunc("GET /api/task-categories", s.pgListTaskCategories)
@@ -1527,23 +1531,11 @@ type createTaskReq struct {
 }
 
 func (s *Server) createTask(w http.ResponseWriter, r *http.Request) {
-	var req createTaskReq
 	if apiKeyPrincipal(r) != nil {
-		var fields map[string]json.RawMessage
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&fields); err != nil {
-			writeErr(w, 400, "Invalid task request")
-			return
-		}
-		allowed := map[string]bool{"name": true, "description": true, "goal": true, "timeout_seconds": true, "plan_heartbeat_seconds": true, "coverage_enabled": true, "seed_first_intent": true}
-		for field := range fields {
-			if !allowed[field] {
-				writeErr(w, 400, "Field is not permitted for API key task creation: "+field)
-				return
-			}
-		}
-		body, _ := json.Marshal(fields)
-		r.Body = io.NopCloser(strings.NewReader(string(body)))
+		s.createIntegrationTask(w, r)
+		return
 	}
+	var req createTaskReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, locale.Text(responseLanguage(w), "bad json: ")+locale.ErrorMessage(responseLanguage(w), err))
 		return

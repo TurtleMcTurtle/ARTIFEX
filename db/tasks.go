@@ -10,6 +10,7 @@ import (
 
 // Task is a row in the task registry (1:1 with an exploration).
 type Task struct {
+	Replay        bool       `json:"-"`
 	ID            int64      `json:"id"`
 	Name          string     `json:"name"` // Optional task name; empty means unnamed.
 	CategoryID    *int64     `json:"category_id,omitempty"`
@@ -143,6 +144,10 @@ func (d *DB) CreateTask(description, goal string, llmProfileID *int64, timeoutSe
 // TaskCreateOptions contains the task data that must be committed atomically
 // with the task/exploration row.
 type TaskCreateOptions struct {
+	SubmissionOwner   string
+	ExternalRequestID string
+	RequestHash       string
+	IntegrationScope  json.RawMessage
 	// Language is persisted atomically in the existing settings table; empty preserves legacy callers.
 	Language             locale.Lang
 	Name                 string // Optional task name; empty means unnamed.
@@ -178,6 +183,31 @@ func (d *DB) CreateTaskWithOptions(description, goal string, opts TaskCreateOpti
 		return nil, err
 	}
 	defer tx.Rollback()
+	if opts.ExternalRequestID != "" {
+		if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, opts.SubmissionOwner+":"+opts.ExternalRequestID); err != nil {
+			return nil, err
+		}
+		var hash string
+		var id sql.NullInt64
+		err := tx.QueryRow(`SELECT request_hash,task_id FROM task_submissions WHERE owner=$1 AND external_request_id=$2`, opts.SubmissionOwner, opts.ExternalRequestID).Scan(&hash, &id)
+		if err == nil {
+			if hash != opts.RequestHash || !id.Valid {
+				return nil, ErrSubmissionConflict
+			}
+			existing, err := scanTask(tx.QueryRow(`SELECT `+taskCols+` FROM tasks WHERE id=$1 AND owner=$2 AND deleted_at IS NULL`, id.Int64, opts.SubmissionOwner))
+			if err == sql.ErrNoRows {
+				return nil, ErrSubmissionConflict
+			}
+			if err != nil {
+				return nil, err
+			}
+			existing.Replay = true
+			return existing, nil
+		}
+		if err != sql.ErrNoRows {
+			return nil, err
+		}
+	}
 	var expID int64
 	if err := tx.QueryRow(`INSERT INTO explorations(description, goal) VALUES ($1,$2) RETURNING id`, description, goal).Scan(&expID); err != nil {
 		return nil, err
@@ -242,6 +272,16 @@ RETURNING id, status, paused, created_at`, opts.Name, opts.CategoryID, descripti
 	}
 	if err := insertTaskRelations(tx, t.ID, opts.SourceTaskIDs); err != nil {
 		return nil, err
+	}
+	if len(opts.IntegrationScope) > 0 {
+		if _, err := tx.Exec(`UPDATE tasks SET integration_scope=$2 WHERE id=$1`, t.ID, string(opts.IntegrationScope)); err != nil {
+			return nil, err
+		}
+	}
+	if opts.ExternalRequestID != "" {
+		if _, err := tx.Exec(`INSERT INTO task_submissions(owner,external_request_id,request_hash,task_id) VALUES($1,$2,$3,$4)`, opts.SubmissionOwner, opts.ExternalRequestID, opts.RequestHash, t.ID); err != nil {
+			return nil, err
+		}
 	}
 	if err := insertTaskCompanies(tx, t.ID, opts.CompanyIDs, opts.Language); err != nil {
 		return nil, err

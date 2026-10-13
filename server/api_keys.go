@@ -187,18 +187,31 @@ func apiKeyRouteScope(method, path string) string {
 		}
 		return ""
 	}
-	if method != "GET" || !strings.HasPrefix(path, "/api/tasks/") {
+	if !strings.HasPrefix(path, "/api/tasks/") {
 		return ""
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/api/tasks/"), "/")
-	if len(parts) != 1 && (len(parts) != 2 || parts[1] != "status") {
-		return ""
-	}
+
 	id, err := strconv.ParseInt(parts[0], 10, 64)
 	if err != nil || id <= 0 || strconv.FormatInt(id, 10) != parts[0] {
 		return ""
 	}
-	return "tasks:read"
+	if method == "POST" && len(parts) == 2 && parts[1] == "cancel" {
+		return "tasks:write"
+	}
+	if method != "GET" {
+		return ""
+	}
+	if len(parts) == 1 || (len(parts) == 2 && (parts[1] == "status" || parts[1] == "report" || parts[1] == "findings")) {
+		return "tasks:read"
+	}
+	if len(parts) == 3 && parts[1] == "findings" {
+		fid, err := strconv.ParseInt(parts[2], 10, 64)
+		if err == nil && fid > 0 && strconv.FormatInt(fid, 10) == parts[2] {
+			return "tasks:read"
+		}
+	}
+	return ""
 }
 
 func (s *Server) taskStatusAPI(w http.ResponseWriter, r *http.Request) {
