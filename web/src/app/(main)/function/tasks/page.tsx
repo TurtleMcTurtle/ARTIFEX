@@ -52,6 +52,7 @@ import { StatusBadge } from "@/components/status-badge";
 import { TablePagination } from "@/components/table-pagination";
 import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
 import { TaskTemplateControls } from "@/components/task-template-controls";
+import { TaskRetentionSettings } from "@/components/task-retention-settings";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -903,6 +904,7 @@ export default function TasksPage() {
                 </>
               )}
               <ConcurrencySettingsDialog />
+              <TaskRetentionSettings />
               <CategoryManagementSheet
                 categories={categories}
                 tasks={tasks}

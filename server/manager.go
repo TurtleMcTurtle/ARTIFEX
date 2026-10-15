@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -417,11 +418,19 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	if proxyAddr != "" {
-		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
-		if err != nil {
-			log.Printf("[traffic] disabled: %v", err)
-		} else {
-			err = tr.RecoverHostDeleteStages(func(_ int64, taskID int64) (bool, error) {
+		var tr *traffic.Traffic
+		// Traffic recovery precedes Server construction. It must join the same
+		// distributed critical section as archive staging and worker recovery,
+		// including Open: SQLite initialization is not safe against a live stage.
+		recoveryCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		locked, err := pg.WithTaskArchiveWorkerLock(recoveryCtx, func() error {
+			var openErr error
+			tr, openErr = traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
+			if openErr != nil {
+				log.Printf("[traffic] disabled: %v", openErr)
+				return nil
+			}
+			return tr.RecoverHostDeleteStages(func(_ int64, taskID int64) (bool, error) {
 				if taskID <= 0 {
 					return false, locale.NewError("Archived traffic staging journal is missing a task ID")
 				}
@@ -433,11 +442,17 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 				// restored task is visible and needs the staged traffic put back.
 				return task == nil, nil
 			})
-			if err != nil {
+		})
+		cancel()
+		if !locked && err == nil {
+			err = locale.NewError("Task maintenance lock is owned by another archive worker; retry manager startup when idle")
+		}
+		if err != nil {
+			if tr != nil {
 				_ = tr.Close()
-				_ = pg.Close()
-				return nil, locale.Errorf("recover traffic delete staging: %w", err)
 			}
+			_ = pg.Close()
+			return nil, locale.Errorf("recover traffic delete staging: %w", err)
 		}
 		if tr != nil {
 			m.traffic = tr

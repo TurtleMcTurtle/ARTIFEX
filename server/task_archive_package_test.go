@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	pgdb "github.com/sebastian93921/artifex/db"
 	"github.com/klauspost/compress/zstd"
+	pgdb "github.com/sebastian93921/artifex/db"
 )
 
 func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
@@ -59,7 +59,7 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 		FormatVersion: pgdb.TaskArchiveFormatVersion, TaskID: 42, ExplorationID: explorationID,
 		StreamedTables: map[string]string{"llm_records": pgdb.TaskArchiveLLMRecordsPath},
 	}
-	original, compressed, checksum, err := writeTaskArchivePackage(archivePath, stage.payload, snapshot)
+	original, compressed, checksum, err := writeTaskArchivePackage(dataDir, archivePath, stage.payload, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	extracted := filepath.Join(dataDir, "restore")
-	if err := extractTaskArchivePackage(archivePath, checksum, extracted); err != nil {
+	if err := extractTaskArchivePackage(dataDir, archivePath, checksum, extracted); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(filepath.Join(extracted, filepath.FromSlash(pgdb.TaskArchiveLLMRecordsPath))); err != nil || !bytes.Equal(got, streamBody) {
@@ -89,7 +89,7 @@ func TestTaskArchivePackageFilesRoundTrip(t *testing.T) {
 			t.Fatalf("restored %s = %q, %v; want %q", path, got, err, want)
 		}
 	}
-	if err := extractTaskArchivePackage(archivePath, "deadbeef", filepath.Join(dataDir, "bad-checksum")); err == nil {
+	if err := extractTaskArchivePackage(dataDir, archivePath, "deadbeef", filepath.Join(dataDir, "bad-checksum")); err == nil {
 		t.Fatal("checksum mismatch was accepted")
 	}
 }
@@ -111,12 +111,12 @@ func TestTaskArchivePackageSkipsSymlink(t *testing.T) {
 
 	archivePath := filepath.Join(dataDir, "archive.tar.zst")
 	snapshot := &pgdb.TaskArchiveSnapshot{FormatVersion: pgdb.TaskArchiveFormatVersion, TaskID: 42}
-	_, _, checksum, err := writeTaskArchivePackage(archivePath, payload, snapshot)
+	_, _, checksum, err := writeTaskArchivePackage(dataDir, archivePath, payload, snapshot)
 	if err != nil {
 		t.Fatalf("archive should skip symlink, not fail: %v", err)
 	}
 	extracted := filepath.Join(dataDir, "restore")
-	if err := extractTaskArchivePackage(archivePath, checksum, extracted); err != nil {
+	if err := extractTaskArchivePackage(dataDir, archivePath, checksum, extracted); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(filepath.Join(extracted, "keep.txt")); err != nil || string(got) != "keep me" {
@@ -154,7 +154,7 @@ func TestTaskArchiveStageJournalRollsBackInterruptedMoves(t *testing.T) {
 	if len(journal.Moves) != 2 {
 		t.Fatalf("journal moves=%d, want 2", len(journal.Moves))
 	}
-	recovered := &taskArchiveFileStage{root: stage.root, payload: stage.payload, journal: journal}
+	recovered := &taskArchiveFileStage{dataDir: dataDir, root: stage.root, payload: stage.payload, journal: journal}
 	if err := recovered.rollback(); err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestTaskArchiveRestoreJournalRollsBackInterruptedInstall(t *testing.T) {
 	if journal.ArchiveID != 11 || len(journal.Moves) != 1 {
 		t.Fatalf("unexpected restore journal: %+v", journal)
 	}
-	recovered := &taskArchiveRestoreFiles{extracted: extracted, moves: journal.Moves}
+	recovered := &taskArchiveRestoreFiles{dataDir: dataDir, taskID: "42", extracted: extracted, moves: journal.Moves}
 	if err := recovered.rollback(); err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestTaskArchiveDeletePackageCanResumeFromStagedPath(t *testing.T) {
 	if err := os.WriteFile(staged, []byte("archive"), archiveFileMode); err != nil {
 		t.Fatal(err)
 	}
-	got, moved, err := stageTaskArchivePackageDelete(archivePath, 21)
+	got, moved, err := stageTaskArchivePackageDelete(dataDir, archivePath, 21)
 	if err != nil || !moved || got != staged {
 		t.Fatalf("resume staged package path=%q moved=%v err=%v", got, moved, err)
 	}
@@ -242,12 +242,13 @@ func TestTaskArchivePackageRejectsTraversal(t *testing.T) {
 	if err := encoder.Close(); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "malicious.tar.zst")
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "malicious.tar.zst")
 	if err := os.WriteFile(path, compressed.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	root := t.TempDir()
-	if err := extractTaskArchivePackage(path, "", root); err == nil {
+	root := filepath.Join(dataDir, "restore")
+	if err := extractTaskArchivePackage(dataDir, path, "", root); err == nil {
 		t.Fatal("path traversal archive was accepted")
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(root), "escape.txt")); !os.IsNotExist(err) {

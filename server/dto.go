@@ -102,6 +102,39 @@ func tokenTotalDTO(u db.TokenUsage) TokenTotalDTO {
 	}
 }
 
+// hydratedTaskDTO applies the persisted list aggregates to every task read shape.
+// Result activity rows are the canonical token source; raw LLM metering/debug
+// rows describe the same calls and must not be added to these totals again.
+func (s *Server) hydratedTaskDTO(t *Task, metrics map[int64]db.TaskListMetrics) (TaskDTO, error) {
+	metric, ok := metrics[t.ExpID]
+	if !ok {
+		return TaskDTO{}, fmt.Errorf("task metrics missing for exploration %d", t.ExpID)
+	}
+	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	dto.Tokens = tokenTotalDTO(metric.Tokens)
+	dto.GoalsTotal = metric.Goals.Total
+	dto.GoalsMet = metric.Goals.Met
+	dto.InFlight = metric.RunningIntents
+	dto.Findings = FindingSeverityDTO{
+		Critical: metric.Findings.Critical,
+		High:     metric.Findings.High,
+		Medium:   metric.Findings.Medium,
+		Low:      metric.Findings.Low,
+	}
+	// The live heartbeat can be newer; persisted activity survives restarts.
+	dto.LastActivity = metric.LastActivity
+	if live := s.engine.LastActivity(t.ID); live > dto.LastActivity {
+		dto.LastActivity = live
+	}
+	return dto, nil
+}
+
+// taskReadMetrics loads one canonical aggregate snapshot per response. Callers
+// must reject storage errors before emitting a task with zero-value counters.
+func (s *Server) taskReadMetrics() (map[int64]db.TaskListMetrics, error) {
+	return s.m.PG().TaskListMetricsAll()
+}
+
 func taskDTO(t *Task, status string) TaskDTO {
 	lifecycle := t.lifecycleSnapshot()
 	llmState := t.llmStateSnapshot()

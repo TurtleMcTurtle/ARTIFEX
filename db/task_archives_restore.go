@@ -2,6 +2,7 @@ package db
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,30 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	}
 	if state != Archiving || taskID != snapshot.TaskID || expID != snapshot.ExplorationID {
 		return locale.Errorf("%w: archive snapshot identity/state mismatch", ErrTaskArchiveState)
+	}
+	// A retention job may have waited in the durable queue while the task was
+	// reopened or paused. Recheck its exact terminal generation under the same
+	// row locks used by compaction; never compact a stale automatic decision.
+	var currentStatus string
+	var paused, queued bool
+	var created time.Time
+	var completed, expected, archiveAt *time.Time
+	if err := tx.QueryRow(`SELECT task.status,task.paused,task.queued,task.created_at,task.completed_at,
+ archive.task_completed_at,archive.retention_archive_at
+FROM tasks task JOIN task_archives archive ON archive.task_id=task.id WHERE archive.id=$1`, archiveID).
+		Scan(&currentStatus, &paused, &queued, &created, &completed, &expected, &archiveAt); err != nil {
+		return err
+	}
+	if archiveAt != nil && (!trustworthyTaskCompletion(currentStatus, paused, queued, created, completed, time.Now()) ||
+		expected == nil || !completed.Equal(*expected) || time.Now().Before(*archiveAt)) {
+		return ErrTaskRetentionIneligible
+	}
+	if archiveAt == nil && (!trustworthyTaskCompletion(currentStatus, paused, queued, created, completed, time.Now()) || expected == nil || !completed.Equal(*expected)) {
+		// Manual archives can still proceed for paused tasks; they must not gain
+		// automatic purge eligibility by retaining an earlier queue snapshot.
+		if _, err := tx.Exec(`UPDATE task_archives SET task_completed_at=NULL WHERE id=$1`, archiveID); err != nil {
+			return err
+		}
 	}
 	var dependent int64
 	err = tx.QueryRow(`SELECT child.id FROM task_relations relation
@@ -126,12 +151,31 @@ AND NOT EXISTS (
 WHERE id=$1`, taskID); err != nil {
 		return err
 	}
+	// PostgreSQL now() is the transaction-start timestamp, potentially hours
+	// before a large compaction succeeds. Capture wall time only at the final
+	// ready transition, then derive the archive-residence deletion deadline.
+	var archivedAt time.Time
+	if err := tx.QueryRow(`SELECT clock_timestamp()`).Scan(&archivedAt); err != nil {
+		return err
+	}
+	var residenceNS *int64
+	if err := tx.QueryRow(`SELECT retention_delete_after_ns FROM task_archives WHERE id=$1`, archiveID).Scan(&residenceNS); err != nil {
+		return err
+	}
+	var deleteAt *time.Time
+	if residenceNS != nil {
+		if *residenceNS <= 0 {
+			return ErrTaskRetentionIneligible
+		}
+		deadline := archivedAt.Add(time.Duration(*residenceNS))
+		deleteAt = &deadline
+	}
 	if _, err := tx.Exec(`UPDATE task_archives SET
 	 state=$2,phase='ready',progress=100,error='',archive_path=$3,sha256=$4,
 	 original_size=$5,compressed_size=$6,data_counts=$7,aggregate_stats=$8,
-	 format_version=$9,archived_at=now(),warnings='[]'
+	 format_version=$9,archived_at=$10,warnings='[]',archive_cleanup_at=NULL,retention_delete_at=$11
 WHERE id=$1`, archiveID, ArchiveReady, archivePath, sha256, originalSize, compressedSize,
-		string(countsRaw), string(statsRaw), snapshot.FormatVersion); err != nil {
+		string(countsRaw), string(statsRaw), snapshot.FormatVersion, archivedAt, deleteAt); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -753,12 +797,28 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 	if state != Deleting {
 		return ErrTaskArchiveState
 	}
+	item, err := scanTaskArchive(tx.QueryRow(`SELECT `+taskArchiveCols+` FROM task_archives WHERE id=$1`, archiveID))
+	if err != nil {
+		return err
+	}
+	if item.RetentionDeleteAt != nil {
+		if item.ArchivedAt == nil || item.RetentionDeleteAfterNS == nil || *item.RetentionDeleteAfterNS <= 0 ||
+			!item.RetentionDeleteAt.Equal(item.ArchivedAt.Add(time.Duration(*item.RetentionDeleteAfterNS))) {
+			return ErrTaskRetentionIneligible
+		}
+		if err := validateColdTaskRetention(context.Background(), tx, item, time.Now(), time.Duration(*item.RetentionDeleteAfterNS)); err != nil {
+			return err
+		}
+	}
 	var dependent int64
 	err = tx.QueryRow(`SELECT task_id FROM task_archives WHERE id<>$1 AND $2=ANY(source_task_ids) LIMIT 1`, archiveID, taskID).Scan(&dependent)
 	if err == nil {
 		return locale.Errorf("%w: task %d", ErrTaskArchiveDeleteBlocked, dependent)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM settings WHERE key='task_language.'||$1::bigint::text`, taskID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1 AND archived_at IS NOT NULL`, taskID); err != nil {

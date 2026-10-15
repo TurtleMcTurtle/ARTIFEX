@@ -295,7 +295,17 @@ func (s *Server) integrationReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "Report storage unavailable")
 		return
 	}
-	status := s.resolvedTaskStatus(t)
+	metrics, err := s.taskReadMetrics()
+	if err != nil {
+		writeErr(w, 503, "Task metrics unavailable")
+		return
+	}
+	dto, err := s.hydratedTaskDTO(t, metrics)
+	if err != nil {
+		writeErr(w, 503, "Task metrics unavailable")
+		return
+	}
+	status := dto.Status
 	outcome := "in_progress"
 	if status == "done" {
 		outcome = "completed_unverified"
@@ -306,7 +316,7 @@ func (s *Server) integrationReport(w http.ResponseWriter, r *http.Request) {
 		outcome = "cancelled"
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, 200, map[string]any{"schema_version": "1", "task": taskDTO(t, status), "external_request_id": external, "scope": scope, "scope_enforcement": "asset_gate_only", "network_scope_enforced": false, "outcome": outcome, "cancel_requested": cancelled, "findings_by_severity": counts, "findings_url": "/api/tasks/" + t.ID + "/findings", "limitations": []string{"No network-egress sandbox; arbitrary tools and redirects are not constrained by asset allowlists.", "Completion and finding counts do not establish executed coverage, verified detection, or a clean assessment."}})
+	writeJSON(w, 200, map[string]any{"schema_version": "1", "task": dto, "external_request_id": external, "scope": scope, "scope_enforcement": "asset_gate_only", "network_scope_enforced": false, "outcome": outcome, "cancel_requested": cancelled, "findings_by_severity": counts, "findings_url": "/api/tasks/" + t.ID + "/findings", "limitations": []string{"No network-egress sandbox; arbitrary tools and redirects are not constrained by asset allowlists.", "Completion and finding counts do not establish executed coverage, verified detection, or a clean assessment."}})
 }
 func (s *Server) integrationCancel(w http.ResponseWriter, r *http.Request) {
 	var req struct{}

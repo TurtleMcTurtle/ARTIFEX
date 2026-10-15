@@ -640,6 +640,18 @@ CREATE TABLE IF NOT EXISTS task_archives (
     updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE task_archives ALTER COLUMN format_version SET DEFAULT 2;
+-- Archive age is based on terminal completion; deletion residence starts at
+-- successful archive-ready time, never queue/start/completion time.
+-- Legacy archives intentionally remain NULL: their pre-archive pause state and
+-- finish timestamp must not be inferred from the compact stub or updated_at.
+ALTER TABLE task_archives ADD COLUMN IF NOT EXISTS task_completed_at TIMESTAMPTZ;
+ALTER TABLE task_archives ADD COLUMN IF NOT EXISTS retention_archive_at TIMESTAMPTZ;
+ALTER TABLE task_archives ADD COLUMN IF NOT EXISTS retention_delete_at TIMESTAMPTZ;
+-- Persist the independent residence duration until successful archival can
+-- establish its deadline. Queued archives have no deletion deadline yet.
+ALTER TABLE task_archives ADD COLUMN IF NOT EXISTS retention_delete_after_ns BIGINT;
+-- A ready package is not enough if hot file/traffic cleanup failed afterwards.
+ALTER TABLE task_archives ADD COLUMN IF NOT EXISTS archive_cleanup_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_task_archives_state ON task_archives(state, requested_at, id);
 CREATE INDEX IF NOT EXISTS idx_task_archives_archived ON task_archives(archived_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_task_archives_sources ON task_archives USING GIN(source_task_ids);

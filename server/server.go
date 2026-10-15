@@ -122,6 +122,11 @@ type Server struct {
 	// channel coalesces enqueue bursts; the database remains the source of truth.
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
+	retentionMu sync.Mutex
+	retentionWake chan struct{}
+	retentionStarted bool
+	retentionRevision string
+	retentionNextCheck time.Time
 	side        *sideQuestionState
 }
 
@@ -844,6 +849,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/llm/records/{id}", s.pgGetLLMRecord)
 	mux.HandleFunc("GET /api/settings", s.getSettings)
 	mux.HandleFunc("PUT /api/settings", s.putSettings)
+	mux.HandleFunc("GET /api/settings/task-retention", s.getTaskRetentionSettings)
+	mux.HandleFunc("PUT /api/settings/task-retention", s.putTaskRetentionSettings)
 	// Finding notification channels are independent resources with multiple instances and individual filters,
 	// so they use dedicated REST endpoints rather than flat /api/settings keys.
 	mux.HandleFunc("GET /api/notify/meta", s.notifyMeta)
@@ -1101,29 +1108,20 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 			active = ""
 		}
 	}
-	metrics, _ := s.m.PG().TaskListMetricsAll()
+	metrics, err := s.taskReadMetrics()
+	if err != nil {
+		writeErr(w, 503, "Task metrics unavailable")
+		return
+	}
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	dtos := make([]TaskDTO, 0, len(list))
 	for _, t := range list {
-		dto := taskDTO(t, s.resolvedTaskStatus(t))
+		dto, err := s.hydratedTaskDTO(t, metrics)
+		if err != nil {
+			writeErr(w, 503, "Task metrics unavailable")
+			return
+		}
 		applyTaskArchiveBlocker(&dto, archiveBlockers)
-		metric := metrics[t.ExpID]
-		dto.Tokens = tokenTotalDTO(metric.Tokens)
-		// prefer the live in-memory heartbeat (fresher) and fall back to the
-		// persisted max activity time (survives restarts) for run-duration display.
-		dto.LastActivity = metric.LastActivity
-		if live := s.engine.LastActivity(t.ID); live > dto.LastActivity {
-			dto.LastActivity = live
-		}
-		dto.GoalsTotal = metric.Goals.Total
-		dto.GoalsMet = metric.Goals.Met
-		dto.InFlight = metric.RunningIntents
-		dto.Findings = FindingSeverityDTO{
-			Critical: metric.Findings.Critical,
-			High:     metric.Findings.High,
-			Medium:   metric.Findings.Medium,
-			Low:      metric.Findings.Low,
-		}
 		dtos = append(dtos, dto)
 	}
 	writeJSON(w, 200, map[string]any{"tasks": dtos, "active": active})
@@ -1807,7 +1805,16 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "task not found")
 		return
 	}
-	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	metrics, err := s.taskReadMetrics()
+	if err != nil {
+		writeErr(w, 503, "Task metrics unavailable")
+		return
+	}
+	dto, err := s.hydratedTaskDTO(t, metrics)
+	if err != nil {
+		writeErr(w, 503, "Task metrics unavailable")
+		return
+	}
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)

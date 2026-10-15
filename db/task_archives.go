@@ -74,6 +74,11 @@ type TaskArchive struct {
 	DataCounts              json.RawMessage `json:"data_counts"`
 	AggregateStats          json.RawMessage `json:"aggregate_stats"`
 	ArchivedAt              *time.Time      `json:"archived_at,omitempty"`
+	TaskCompletedAt         *time.Time      `json:"task_completed_at,omitempty"`
+	RetentionArchiveAt      *time.Time      `json:"retention_archive_at,omitempty"`
+	RetentionDeleteAt       *time.Time      `json:"retention_delete_at,omitempty"`
+	RetentionDeleteAfterNS  *int64          `json:"-"`
+	ArchiveCleanupAt        *time.Time      `json:"archive_cleanup_at,omitempty"`
 	RequestedAt             time.Time       `json:"requested_at"`
 	CreatedAt               time.Time       `json:"created_at"`
 	UpdatedAt               time.Time       `json:"updated_at"`
@@ -139,7 +144,8 @@ func scanTaskArchive(sc interface{ Scan(...any) error }) (*TaskArchive, error) {
 		&item.TaskGoal, &item.OriginalStatus, &item.CategoryIDSnapshot,
 		&item.CategoryNameSnapshot, &sources, &item.RemainingTimeoutSeconds,
 		&item.DataCounts, &item.AggregateStats, &item.ArchivedAt, &item.RequestedAt,
-		&item.CreatedAt, &item.UpdatedAt,
+		&item.CreatedAt, &item.UpdatedAt, &item.TaskCompletedAt, &item.RetentionArchiveAt, &item.RetentionDeleteAt, &item.ArchiveCleanupAt,
+		&item.RetentionDeleteAfterNS,
 	)
 	if err != nil {
 		return nil, err
@@ -165,7 +171,7 @@ compressed_size, COALESCE(task_name,''), COALESCE(task_description,''),
 COALESCE(task_goal,''), COALESCE(original_status,''), category_id_snapshot,
 COALESCE(category_name_snapshot,''), array_to_json(source_task_ids)::text,
 remaining_timeout_seconds, data_counts, aggregate_stats, archived_at,
-requested_at, created_at, updated_at`
+requested_at, created_at, updated_at, task_completed_at, retention_archive_at, retention_delete_at, archive_cleanup_at, retention_delete_after_ns`
 
 func (d *DB) GetTaskArchive(id int64) (*TaskArchive, error) {
 	item, err := scanTaskArchive(d.QueryRow(`SELECT `+taskArchiveCols+` FROM task_archives WHERE id=$1`, id))
@@ -218,7 +224,11 @@ ORDER BY COALESCE(archived_at, requested_at) DESC, id DESC LIMIT $3 OFFSET $4`, 
 // QueueTaskArchive validates lifecycle and direct inheritance while holding the
 // task row. A failed archive can be explicitly retried through the same API.
 func (d *DB) QueueTaskArchive(taskID int64) (*TaskArchive, error) {
-	tx, err := d.Begin()
+	return d.queueTaskArchive(context.Background(), taskID, nil)
+}
+
+func (d *DB) queueTaskArchive(ctx context.Context, taskID int64, retention *taskRetentionRequest) (*TaskArchive, error) {
+	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -227,17 +237,23 @@ func (d *DB) QueueTaskArchive(taskID int64) (*TaskArchive, error) {
 	var categoryID *int64
 	var paused, queued bool
 	var deadline *time.Time
-	err = tx.QueryRow(`SELECT COALESCE(t.name,''), t.description, t.goal, t.status,
- t.category_id, COALESCE(c.name,''), t.paused, t.queued, t.deadline_at
+	var completed *time.Time
+	var created time.Time
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(t.name,''), t.description, t.goal, t.status,
+ t.category_id, COALESCE(c.name,''), t.paused, t.queued, t.deadline_at, t.completed_at, t.created_at
 FROM tasks t LEFT JOIN task_categories c ON c.id=t.category_id
 WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE OF t`, taskID).Scan(
-		&name, &description, &goal, &status, &categoryID, &categoryName, &paused, &queued, &deadline,
+		&name, &description, &goal, &status, &categoryID, &categoryName, &paused, &queued, &deadline, &completed, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrTaskArchiveNotFound
 	}
 	if err != nil {
 		return nil, err
+	}
+	if retention != nil && (!trustworthyTaskCompletion(status, paused, queued, created, completed, retention.now) ||
+		retention.now.Before(completed.Add(retention.archiveAfter))) {
+		return nil, ErrTaskRetentionIneligible
 	}
 	if queued {
 		return nil, ErrTaskArchiveQueued
@@ -246,7 +262,7 @@ WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE OF t`, taskID).Scan(
 		return nil, ErrTaskArchiveIneligible
 	}
 	var dependent int64
-	err = tx.QueryRow(`SELECT child.id FROM task_relations relation
+	err = tx.QueryRowContext(ctx, `SELECT child.id FROM task_relations relation
 JOIN tasks child ON child.id=relation.task_id AND child.deleted_at IS NULL
 LEFT JOIN task_archives pending ON pending.task_id=child.id
 WHERE relation.source_task_id=$1
@@ -259,7 +275,7 @@ LIMIT 1`, taskID).Scan(&dependent)
 		return nil, err
 	}
 	var sources []int64
-	rows, err := tx.Query(`SELECT source_task_id FROM task_relations WHERE task_id=$1 ORDER BY created_at, source_task_id`, taskID)
+	rows, err := tx.QueryContext(ctx, `SELECT source_task_id FROM task_relations WHERE task_id=$1 ORDER BY created_at, source_task_id`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -284,24 +300,55 @@ LIMIT 1`, taskID).Scan(&dependent)
 			remaining = 0
 		}
 	}
-	_, err = tx.Exec(`INSERT INTO task_archives(
+	// Manual paused archives are not automatically purged. Only an unpaused,
+	// terminal task with a real finish timestamp can supply retention metadata.
+	if !trustworthyTaskCompletion(status, paused, queued, created, completed, time.Now()) {
+		if retention != nil {
+			return nil, ErrTaskRetentionIneligible
+		}
+		completed = nil
+	}
+	// Another process may have queued this same candidate after discovery. A
+	// repeated automatic enqueue is a no-op, not another counted transition.
+	if retention != nil {
+		var existing string
+		err := tx.QueryRowContext(ctx, `SELECT state FROM task_archives WHERE task_id=$1`, taskID).Scan(&existing)
+		if err == nil && existing != ArchiveFailed {
+			return nil, ErrTaskArchiveState
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
+	var archiveAt, deleteAt *time.Time
+	var deleteAfterNS *int64
+	if retention != nil {
+		at, duration := completed.Add(retention.archiveAfter), int64(retention.deleteAfter)
+		archiveAt, deleteAfterNS = &at, &duration
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO task_archives(
  task_id,state,phase,progress,error,warnings,format_version,task_name,
  task_description,task_goal,original_status,category_id_snapshot,
- category_name_snapshot,source_task_ids,remaining_timeout_seconds,requested_at)
-VALUES ($1,$2,'queued',0,'','[]',$3,$4,$5,$6,$7,$8,$9,$10,$11,now())
+ category_name_snapshot,source_task_ids,remaining_timeout_seconds,requested_at,task_completed_at,retention_archive_at,retention_delete_at,retention_delete_after_ns)
+VALUES ($1,$2,'queued',0,'','[]',$3,$4,$5,$6,$7,$8,$9,$10,$11,now(),$12,$13,$14,$15)
 	ON CONFLICT (task_id) DO UPDATE SET
 	 state=CASE WHEN task_archives.state IN ('archive_failed') THEN EXCLUDED.state ELSE task_archives.state END,
 	 phase=CASE WHEN task_archives.state IN ('archive_failed') THEN 'queued' ELSE task_archives.phase END,
 	 progress=CASE WHEN task_archives.state IN ('archive_failed') THEN 0 ELSE task_archives.progress END,
 	 error=CASE WHEN task_archives.state IN ('archive_failed') THEN '' ELSE task_archives.error END,
 	 format_version=CASE WHEN task_archives.state IN ('archive_failed') THEN EXCLUDED.format_version ELSE task_archives.format_version END,
-	 requested_at=CASE WHEN task_archives.state IN ('archive_failed') THEN now() ELSE task_archives.requested_at END`,
+	 requested_at=CASE WHEN task_archives.state IN ('archive_failed') THEN now() ELSE task_archives.requested_at END,
+	 task_completed_at=CASE WHEN task_archives.state IN ('archive_failed') THEN EXCLUDED.task_completed_at ELSE task_archives.task_completed_at END,
+	 original_status=CASE WHEN task_archives.state IN ('archive_failed') THEN EXCLUDED.original_status ELSE task_archives.original_status END,
+	 retention_archive_at=CASE WHEN task_archives.state IN ('archive_failed') THEN EXCLUDED.retention_archive_at ELSE task_archives.retention_archive_at END,
+	 retention_delete_at=CASE WHEN task_archives.state IN ('archive_failed') THEN EXCLUDED.retention_delete_at ELSE task_archives.retention_delete_at END,
+	 retention_delete_after_ns=CASE WHEN task_archives.state IN ('archive_failed') THEN EXCLUDED.retention_delete_after_ns ELSE task_archives.retention_delete_after_ns END`,
 		taskID, ArchiveQueued, TaskArchiveFormatVersion, name, description, goal, status,
-		categoryID, categoryName, sources, remaining)
+		categoryID, categoryName, sources, remaining, completed, archiveAt, deleteAt, deleteAfterNS)
 	if err != nil {
 		return nil, err
 	}
-	item, err := scanTaskArchive(tx.QueryRow(`SELECT `+taskArchiveCols+` FROM task_archives WHERE task_id=$1`, taskID))
+	item, err := scanTaskArchive(tx.QueryRowContext(ctx, `SELECT `+taskArchiveCols+` FROM task_archives WHERE task_id=$1`, taskID))
 	if err != nil {
 		return nil, err
 	}
@@ -322,20 +369,35 @@ WHERE id=$1 AND state IN ('ready','restore_failed') RETURNING `+taskArchiveCols,
 }
 
 func (d *DB) QueueTaskArchiveDelete(id int64) (*TaskArchive, error) {
-	tx, err := d.Begin()
+	return d.queueTaskArchiveDelete(context.Background(), id, nil)
+}
+
+func (d *DB) queueTaskArchiveDelete(ctx context.Context, id int64, retention *taskRetentionRequest) (*TaskArchive, error) {
+	tx, err := d.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	var taskID int64
-	if err := tx.QueryRow(`SELECT task_id FROM task_archives WHERE id=$1 AND state IN ('ready','delete_failed') FOR UPDATE`, id).Scan(&taskID); err != nil {
+	item, err := scanTaskArchive(tx.QueryRowContext(ctx, `SELECT `+taskArchiveCols+` FROM task_archives WHERE id=$1 FOR UPDATE`, id))
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrTaskArchiveState
 		}
 		return nil, err
 	}
+	if retention != nil {
+		if item.State != ArchiveReady && item.State != DeleteFailed {
+			return nil, ErrTaskRetentionIneligible
+		}
+		if err := validateColdTaskRetention(ctx, tx, item, retention.now, retention.deleteAfter); err != nil {
+			return nil, err
+		}
+	} else if item.State != ArchiveReady && item.State != DeleteFailed {
+		return nil, ErrTaskArchiveState
+	}
+	taskID := item.TaskID
 	var dependent int64
-	err = tx.QueryRow(`SELECT task_id FROM task_archives
+	err = tx.QueryRowContext(ctx, `SELECT task_id FROM task_archives
 WHERE id<>$1 AND $2=ANY(source_task_ids) AND state NOT IN ('delete_queued','deleting') LIMIT 1`, id, taskID).Scan(&dependent)
 	if err == nil {
 		return nil, locale.Errorf("%w: task %d", ErrTaskArchiveDeleteBlocked, dependent)
@@ -343,9 +405,15 @@ WHERE id<>$1 AND $2=ANY(source_task_ids) AND state NOT IN ('delete_queued','dele
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	item, err := scanTaskArchive(tx.QueryRow(`UPDATE task_archives
-SET state=$2, phase='queued', progress=0, error='', requested_at=now()
-WHERE id=$1 RETURNING `+taskArchiveCols, id, DeleteQueued))
+	var deleteAt *time.Time
+	var deleteAfterNS *int64
+	if retention != nil {
+		at, duration := item.ArchivedAt.Add(retention.deleteAfter), int64(retention.deleteAfter)
+		deleteAt, deleteAfterNS = &at, &duration
+	}
+	item, err = scanTaskArchive(tx.QueryRowContext(ctx, `UPDATE task_archives
+SET state=$2, phase='queued', progress=0, error='', requested_at=now(),retention_delete_at=$3,retention_delete_after_ns=$4
+WHERE id=$1 RETURNING `+taskArchiveCols, id, DeleteQueued, deleteAt, deleteAfterNS))
 	if err != nil {
 		return nil, err
 	}

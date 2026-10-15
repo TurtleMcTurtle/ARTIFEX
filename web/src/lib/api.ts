@@ -8,6 +8,7 @@ import { translate as swt } from "@/i18n/runtime";
 // are passed through and formatted at the call site.
 
 import type { ChatMention } from "@/lib/chat-mentions";
+import type { TaskRetentionInput, TaskRetentionSettings } from "@/lib/task-retention";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
 import type {
@@ -804,6 +805,8 @@ export const api = {
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
+  taskRetention: () => http<TaskRetentionSettings>("/settings/task-retention", { cache: "no-store" }),
+  saveTaskRetention: (input: TaskRetentionInput) => put<TaskRetentionSettings>("/settings/task-retention", input),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;

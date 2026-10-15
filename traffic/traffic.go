@@ -31,10 +31,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/sebastian93921/artifex/db"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	mproxy "github.com/lqqyt2423/go-mitmproxy/proxy"
+	"github.com/sebastian93921/artifex/db"
 	_ "modernc.org/sqlite"
 )
 
@@ -1353,17 +1353,22 @@ func restoreTrees(stageDir string, moves []stagedTrafficPath) error {
 // step that used to stall the recorder: a legacy tree mirrors the URL path per
 // request and can hold hundreds of thousands of small files, and the whole unlink
 // ran while the write lock was held. The rows are already gone by now, so losing
-// this to a shutdown leaves garbage under _delete_staging, never inconsistent
-// state.
-func (t *Traffic) reapStage(stageDir string) {
+// this to a shutdown leaves garbage under _delete_staging. Archive callers must
+// await the result before positively confirming retention cleanup.
+func (t *Traffic) reapStage(stageDir string) <-chan error {
+	done := make(chan error, 1)
 	if stageDir == "" {
-		return
+		done <- nil
+		return done
 	}
 	t.reaping.Go(func() {
-		if err := os.RemoveAll(stageDir); err != nil {
+		err := os.RemoveAll(stageDir)
+		if err != nil {
 			log.Printf(locale.Text(locale.ServerDefault(), "[traffic] Could not clean legacy traffic directory %s: %v"), stageDir, err)
 		}
+		done <- err
 	})
+	return done
 }
 
 // DeleteHostsExact removes recorded exchanges for a set of EXACT hosts (the
@@ -1396,6 +1401,7 @@ type HostDeleteStage struct {
 	moves    []stagedTrafficPath
 	deleted  int64
 	done     bool
+	archive  bool // cleanup must finish before retention can confirm success
 }
 
 // Deleted reports the number of exchange rows selected by this stage.
@@ -1424,7 +1430,7 @@ func (t *Traffic) StageDeleteHostsExactForArchive(hosts []string, archiveID, tas
 
 func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64) (*HostDeleteStage, error) {
 	t.wmu.Lock()
-	stage := &HostDeleteStage{traffic: t}
+	stage := &HostDeleteStage{traffic: t, archive: archiveID > 0}
 	fail := func(cause error) (*HostDeleteStage, error) {
 		if rollbackErr := stage.rollbackLocked(); rollbackErr != nil {
 			return nil, errors.Join(cause, locale.Errorf("Roll back traffic deletion: %w", rollbackErr))
@@ -1662,7 +1668,7 @@ func (s *HostDeleteStage) Commit() error {
 	// Unlinking the staged trees is what used to hold the write lock for hours;
 	// it now runs in the background, while collection below only needs them to be
 	// out of the live tree — which the staging rename already guaranteed.
-	s.traffic.reapStage(s.stageDir)
+	cleanup := s.traffic.reapStage(s.stageDir)
 	s.traffic.reclaim()
 	var errs []error
 	if err := s.traffic.gcBlobs(); err != nil {
@@ -1670,6 +1676,13 @@ func (s *HostDeleteStage) Commit() error {
 	}
 	s.done = true
 	s.traffic.wmu.Unlock()
+	if s.archive {
+		// Do not hold the recorder write lock during a potentially large unlink,
+		// but do keep the archive caller waiting for its real outcome.
+		if err := <-cleanup; err != nil {
+			errs = append(errs, locale.Errorf("Clean archived traffic stage: %w", err))
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -1798,9 +1811,10 @@ func (t *Traffic) reclaimChunk(ctx context.Context, conn *sql.Conn, merges *int)
 // come from blob_refs, so collection is one query plus a sweep of the blob
 // directory — no exchange body is ever read. Emptied bucket directories are
 // removed as well; the previous file-scanning collector deleted only files and
-// left the buckets behind permanently. Best-effort: walk errors only skip the
-// affected entries. Callers must hold wmu so this never races a concurrent
-// record() writing a fresh blob + reference.
+// left the buckets behind permanently. Inspection and unreferenced-file unlink
+// errors must reach the caller: committed index deletion alone is not confirmed
+// hot-blob cleanup. Empty-directory removal remains best-effort. Callers must
+// hold wmu so this never races record() writing a fresh blob + reference.
 func (t *Traffic) gcBlobs() error {
 	refs := make(map[string]struct{})
 	rows, err := t.db.Query(`SELECT DISTINCT hash FROM blob_refs`)
@@ -1826,8 +1840,14 @@ func (t *Traffic) gcBlobs() error {
 	root := filepath.Join(t.dir, "_blobs", "sha256")
 	var buckets []string
 	if err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d == nil {
+		if os.IsNotExist(err) {
 			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if d == nil {
+			return locale.Errorf("Could not inspect traffic blob path %s", p)
 		}
 		if d.IsDir() {
 			if p != root {
@@ -1837,7 +1857,9 @@ func (t *Traffic) gcBlobs() error {
 		}
 		h := strings.TrimSuffix(d.Name(), ".bin")
 		if _, ok := refs[h]; !ok {
-			os.Remove(p)
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {
@@ -1868,8 +1890,11 @@ func (t *Traffic) legacyBlobRefs(refs map[string]struct{}) error {
 	}
 	blobRe := regexp.MustCompile(`@blob sha256:([0-9a-f]{64})`)
 	return filepath.WalkDir(t.dir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d == nil {
-			return nil // skip unreadable entries
+		if err != nil {
+			return err
+		}
+		if d == nil {
+			return locale.Errorf("Could not inspect legacy traffic reference %s", p)
 		}
 		if d.IsDir() {
 			// _blobs/_index/_ca never contain references; skip their subtrees.
@@ -1883,7 +1908,7 @@ func (t *Traffic) legacyBlobRefs(refs map[string]struct{}) error {
 		}
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return nil
+			return err
 		}
 		for _, m := range blobRe.FindAllSubmatch(b, -1) {
 			refs[string(m[1])] = struct{}{}

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/sebastian93921/artifex/internal/archivefs"
 )
 
 // ArchiveSnapshot is the portable traffic subset embedded in one task archive.
@@ -48,7 +50,26 @@ func (t *Traffic) ExportHosts(hosts []string, dir string) (int64, error) {
 	if t == nil || len(hosts) == 0 {
 		return 0, nil
 	}
-	if err := os.MkdirAll(filepath.Join(dir, "blobs"), 0o700); err != nil {
+	source, err := archivefs.Open(t.dir, false, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer source.Close()
+	destination, err := archivefs.Open(dir, true, 0o700)
+	if err != nil {
+		return 0, err
+	}
+	defer destination.Close()
+	return t.ExportHostsAt(hosts, source, destination)
+}
+
+// ExportHostsAt uses roots derived from the caller's pinned data directory for
+// every source read and destination write, not only a top-level path check.
+func (t *Traffic) ExportHostsAt(hosts []string, source, destination *os.Root) (int64, error) {
+	if t == nil || len(hosts) == 0 {
+		return 0, nil
+	}
+	if err := archivefs.MkdirAll(destination, "blobs", 0o700); err != nil {
 		return 0, err
 	}
 	t.wmu.Lock()
@@ -79,11 +100,11 @@ FROM exchanges WHERE host IN (`+strings.Join(placeholders, ",")+`) ORDER BY ts,i
 		err := t.db.QueryRow(`SELECT req_head,req_body,req_blob,resp_head,resp_body,resp_blob
 FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &reqBlob, &item.RespHead, &item.RespBody, &respBlob)
 		if errors.Is(err, sql.ErrNoRows) && strings.TrimSpace(legacyPath) != "" {
-			req, readErr := os.ReadFile(filepath.Join(t.dir, legacyPath, "request.http"))
+			req, readErr := archivefs.ReadFile(source, filepath.Join(legacyPath, "request.http"))
 			if readErr != nil && !os.IsNotExist(readErr) {
 				return 0, readErr
 			}
-			resp, readErr := os.ReadFile(filepath.Join(t.dir, legacyPath, "response.http"))
+			resp, readErr := archivefs.ReadFile(source, filepath.Join(legacyPath, "response.http"))
 			if readErr != nil && !os.IsNotExist(readErr) {
 				return 0, readErr
 			}
@@ -103,15 +124,11 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 		return 0, err
 	}
 	for hash := range blobs {
-		source, err := t.blobPath(hash)
+		data, err := archivedBlob(source, hash)
 		if err != nil {
 			return 0, err
 		}
-		data, err := os.ReadFile(source)
-		if err != nil {
-			return 0, err
-		}
-		if err := os.WriteFile(filepath.Join(dir, "blobs", hash+".bin"), data, 0o600); err != nil {
+		if err := archivefs.WriteFile(destination, filepath.Join("blobs", hash+".bin"), data, 0o600); err != nil {
 			return 0, err
 		}
 		snapshot.Blobs = append(snapshot.Blobs, hash)
@@ -121,7 +138,7 @@ FROM exchange_bodies WHERE id=?`, item.ID).Scan(&item.ReqHead, &item.ReqBody, &r
 	if err != nil {
 		return 0, err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "traffic.json"), raw, 0o600); err != nil {
+	if err := archivefs.WriteFile(destination, "traffic.json", raw, 0o600); err != nil {
 		return 0, err
 	}
 	return int64(len(snapshot.Exchanges)), nil
@@ -133,7 +150,28 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 	if t == nil {
 		return 0, nil
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "traffic.json"))
+	source, err := archivefs.Open(dir, false, 0)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer source.Close()
+	destination, err := archivefs.Open(t.dir, false, 0)
+	if err != nil {
+		return 0, err
+	}
+	defer destination.Close()
+	return t.ImportArchiveAt(source, destination)
+}
+
+// ImportArchiveAt confines both the extraction source and the hot blob store.
+func (t *Traffic) ImportArchiveAt(source, destination *os.Root) (int64, error) {
+	if t == nil {
+		return 0, nil
+	}
+	raw, err := archivefs.ReadFile(source, "traffic.json")
 	if os.IsNotExist(err) {
 		return 0, nil
 	}
@@ -153,7 +191,7 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 		if !blobHashRe.MatchString(hash) {
 			return 0, locale.Errorf("invalid archived traffic blob %q", hash)
 		}
-		data, err := os.ReadFile(filepath.Join(dir, "blobs", hash+".bin"))
+		data, err := archivefs.ReadFile(source, filepath.Join("blobs", hash+".bin"))
 		if err != nil {
 			return 0, err
 		}
@@ -161,14 +199,19 @@ func (t *Traffic) ImportArchive(dir string) (int64, error) {
 		if hex.EncodeToString(sum[:]) != hash {
 			return 0, locale.Errorf("traffic blob checksum mismatch: %s", hash)
 		}
-		destination := filepath.Join(t.dir, "_blobs", "sha256", hash[:2], hash+".bin")
-		if _, err := os.Stat(destination); os.IsNotExist(err) {
-			if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		target := filepath.Join("_blobs", "sha256", hash[:2], hash+".bin")
+		if err := archivefs.Check(destination, target); err != nil {
+			return 0, err
+		}
+		if _, err := destination.Stat(target); os.IsNotExist(err) {
+			if err := archivefs.MkdirAll(destination, filepath.Dir(target), 0o755); err != nil {
 				return 0, err
 			}
-			if err := os.WriteFile(destination, data, 0o644); err != nil {
+			if err := archivefs.WriteFile(destination, target, data, 0o644); err != nil {
 				return 0, err
 			}
+		} else if err != nil {
+			return 0, err
 		}
 	}
 	tx, err := t.db.Begin()
@@ -216,6 +259,24 @@ VALUES(?,?,?,?,?,?,?)`, item.ID, item.ReqHead, item.ReqBody, nullIfEmpty(item.Re
 		return imported, err
 	}
 	return imported, nil
+}
+
+// Current writes use one bucket level; retain the old two-level read layout.
+func archivedBlob(root *os.Root, hash string) ([]byte, error) {
+	if !blobHashRe.MatchString(hash) {
+		return nil, locale.Errorf("Invalid blob hash")
+	}
+	for _, path := range []string{
+		filepath.Join("_blobs", "sha256", hash[:2], hash+".bin"),
+		filepath.Join("_blobs", "sha256", hash[:2], hash[2:4], hash+".bin"),
+	} {
+		data, err := archivefs.ReadFile(root, path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		return data, err
+	}
+	return nil, locale.Errorf("Blob %s does not exist", hash)
 }
 
 func uniqueArchiveHosts(hosts []string) []string {

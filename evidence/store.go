@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/sebastian93921/artifex/db"
+	"github.com/sebastian93921/artifex/internal/archivefs"
 	"github.com/sebastian93921/artifex/traffic"
 )
 
@@ -46,6 +47,10 @@ func verifyFile(path, hash string, length int64) error {
 		return err
 	}
 	defer f.Close()
+	return verifyOpenBody(f, hash, length)
+}
+
+func verifyOpenBody(f *os.File, hash string, length int64) error {
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
@@ -269,28 +274,75 @@ func (s *Store) CopySnapshots(ctx context.Context, snapshots []db.TrafficEvidenc
 }
 
 func (s *Store) copySnapshots(snapshots []db.TrafficEvidenceSnapshot, dest string) error {
+	if len(snapshots) == 0 {
+		return nil
+	}
+	source, err := archivefs.Open(s.Dir, false, 0)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	destination, err := archivefs.Open(dest, true, 0700)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+	return s.copySnapshotsAt(snapshots, source, destination)
+}
+
+// CopySnapshotsAt carries caller-pinned archive and evidence roots through all
+// nested body reads, writes and existing-body verification.
+func (s *Store) CopySnapshotsAt(ctx context.Context, snapshots []db.TrafficEvidenceSnapshot, source, destination *os.Root) error {
+	return s.DB.WithEvidenceTx(ctx, func(*sql.Tx) error { return s.copySnapshotsAt(snapshots, source, destination) })
+}
+
+func openArchiveBody(root *os.Root, hash string, length int64) (*os.File, error) {
+	path, err := hashPath(".", hash)
+	if err != nil {
+		return nil, err
+	}
+	f, err := archivefs.OpenFile(root, path, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyOpenBody(f, hash, length); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+func (s *Store) copySnapshotsAt(snapshots []db.TrafficEvidenceSnapshot, source, destination *os.Root) error {
 	for _, v := range snapshots {
 		for _, side := range []string{"request", "response"} {
 			if err := func() error {
-				f, length, err := s.OpenBody(v, side)
+				hash, length := v.ReqHash, v.ReqLen
+				if side == "response" {
+					hash, length = v.RespHash, v.RespLen
+				}
+				f, err := openArchiveBody(source, hash, length)
 				if err != nil {
 					return err
 				}
 				defer f.Close()
-				hash := v.ReqHash
-				if side == "response" {
-					hash = v.RespHash
-				}
-				target, err := hashPath(dest, hash)
+				target, err := hashPath(".", hash)
 				if err != nil {
 					return err
 				}
-				if err = os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+				if err = archivefs.MkdirAll(destination, filepath.Dir(target), 0o700); err != nil {
 					return err
 				}
-				out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+				out, err := archivefs.OpenFile(destination, target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 				if os.IsExist(err) {
-					return verifyFile(target, hash, length)
+					already, err := openArchiveBody(destination, hash, length)
+					if err != nil {
+						return err
+					}
+					return already.Close()
 				}
 				if err != nil {
 					return err
@@ -314,6 +366,25 @@ func (s *Store) InstallSnapshots(ctx context.Context, snapshots []db.TrafficEvid
 // WithInstalledSnapshots pins installed bodies until the metadata restore finishes.
 // The callback must not acquire another evidence advisory lock.
 func (s *Store) WithInstalledSnapshots(ctx context.Context, snapshots []db.TrafficEvidenceSnapshot, source string, restore func() error) error {
+	if len(snapshots) == 0 {
+		return s.WithInstalledSnapshotsAt(ctx, snapshots, nil, nil, restore)
+	}
+	from, err := archivefs.Open(source, false, 0)
+	if err != nil {
+		return err
+	}
+	defer from.Close()
+	to, err := archivefs.Open(s.Dir, true, 0700)
+	if err != nil {
+		return err
+	}
+	defer to.Close()
+	return s.WithInstalledSnapshotsAt(ctx, snapshots, from, to, restore)
+}
+
+// WithInstalledSnapshotsAt confines extraction reads and hot-store installs to
+// roots derived from the same pinned task data tree used by the restore caller.
+func (s *Store) WithInstalledSnapshotsAt(ctx context.Context, snapshots []db.TrafficEvidenceSnapshot, source, destination *os.Root, restore func() error) error {
 	return s.DB.WithEvidenceTx(ctx, func(*sql.Tx) error {
 		for _, v := range snapshots {
 			if v.ID != db.TrafficSnapshotID(v) {
@@ -324,17 +395,12 @@ func (s *Store) WithInstalledSnapshots(ctx context.Context, snapshots []db.Traff
 				length int64
 			}{{v.ReqHash, v.ReqLen}, {v.RespHash, v.RespLen}} {
 				if err := func() error {
-					path, err := hashPath(source, body.hash)
-					if err != nil {
-						return err
-					}
-					f, err := os.Open(path)
+					f, err := openArchiveBody(source, body.hash, body.length)
 					if err != nil {
 						return err
 					}
 					defer f.Close()
-					_, err = s.writeBody(f, body.length, body.hash)
-					return err
+					return installArchiveBody(destination, f, body.length, body.hash)
 				}(); err != nil {
 					return err
 				}
