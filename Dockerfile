@@ -1,5 +1,5 @@
 # Build the frontend and binary from this checkout; no published image is required.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS frontend
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS frontend
 WORKDIR /src/web
 COPY web/package*.json ./
 RUN npm ci
@@ -23,7 +23,7 @@ FROM python:3.12-slim-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
