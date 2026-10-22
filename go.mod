@@ -1,6 +1,6 @@
 module github.com/sebastian93921/artifex
 
-go 1.26.3
+go 1.27.3
 
 require (
 	github.com/Autumn-27/norma v0.4.3
