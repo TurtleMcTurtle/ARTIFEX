@@ -1,4 +1,4 @@
-# Skynet / ARTIFEX integration contract (schema version 1)
+# ARTIFEX task integration contract (schema version 1)
 
 These extensions use existing owner-bound API keys: Bearer or X-API-Key,
 `tasks:read` / `tasks:write`. Keys still cannot access admin, profiles, raw LLM
@@ -12,7 +12,7 @@ per-key tenancy**. Unowned task/finding reads are 404.
 
 ```json
 {
-  "external_request_id": "skynet:assessment-123",
+  "external_request_id": "assessment-123",
   "name": "assessment-123",
   "description": "Approved staging assessment",
   "goal": "Minimal non-destructive verification",
@@ -21,7 +21,7 @@ per-key tenancy**. Unowned task/finding reads are 404.
 }
 ```
 
-Alternatively use `Idempotency-Key: skynet:assessment-123`; both values must agree
+Alternatively use `Idempotency-Key: assessment-123`; both values must agree
 when both are present. ID grammar: `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`. IDs are
 owner-scoped, persistent, and have no expiry. Same decoded request returns 200
 with the existing task DTO and `Idempotency-Replayed: true`; new creation returns
@@ -42,7 +42,7 @@ retain optional scope. Accepted fields only: `name`, `description`, `goal`,
 `external_request_id`, `scope`, `timeout_seconds`, `plan_heartbeat_seconds`,
 `coverage_enabled`, `seed_first_intent`. Body max 64 KiB; name max 200 bytes;
 description/goal max 16384 bytes; timeout/heartbeat 0..86400 seconds (0 timeout
-means unlimited; heartbeat values below 600 become 600). Skynet should always
+means unlimited; heartbeat values below 600 become 600). Clients should always
 send a positive timeout and keep concurrency/cost limits outside this API.
 
 ### Scope limitation — rollout blocker
@@ -116,5 +116,5 @@ Tests cancel runtime context; no live scans. Cover concurrent HTTP and direct DB
 submissions, atomic rollback, replay/conflict/tombstone/owner checks, handle
 reload, scoped finding access, durable cancellation/admission rejection,
 malformed/oversized input and no-admin allowlist. Parent must deploy to isolated
-staging and coordinate actual Skynet submit/poll/report/cancel tests before any
+staging and coordinate actual client submit/poll/report/cancel tests before any
 production cutover. No child deployment is performed.

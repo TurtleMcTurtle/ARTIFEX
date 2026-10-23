@@ -31,6 +31,10 @@ This is the translated upstream ARTEX history from baseline `160fe13`, preservin
   [Autumn-27/ARTEX](https://github.com/Autumn-27/ARTEX) at commit `160fe13` is retained in
   [docs/PROVENANCE.md](docs/PROVENANCE.md). Existing databases keep their configured users; the
   `artex` DB name/role must be renamed when upgrading a deployed instance.
+- Removed the internal integration client's name from the public tree: renamed
+  `docs/task-integration.md` (was the client-specific contract doc) and its
+  cross-repo transport test/env var, and neutralised the retention confirmation
+  strings in English and Chinese. The HTTP contract and behaviour are unchanged.
 
 ### Interception
 

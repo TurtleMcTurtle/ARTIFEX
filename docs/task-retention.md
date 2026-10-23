@@ -90,7 +90,7 @@ previously prepared images do not establish that this repaired source is live.
 
 Open **Current tasks → Retention settings**, next to Concurrency settings. The dialog shows the effective policy and saves it in ARTIFEX's existing `settings` table. Saved values override the startup environment and survive restart; no retention schema migration is needed for this UI.
 
-The dialog uses whole days for completion age and archive residence, and hours for the check interval. Defaults are 7 days, 30 days and 24 hours. Advanced limits default to 50 transitions and 120 seconds. Enabling requires a separate confirmation explaining permanent deletion, Skynet's live-report limitation and preservation of required snapshots. Opening the dialog, cancelling it or saving does not perform an immediate cleanup.
+The dialog uses whole days for completion age and archive residence, and hours for the check interval. Defaults are 7 days, 30 days and 24 hours. Advanced limits default to 50 transitions and 120 seconds. Enabling requires a separate confirmation explaining permanent deletion, the live-report limitation for API-key clients and preservation of required snapshots. Opening the dialog, cancelling it or saving does not perform an immediate cleanup.
 
 The administrator-only `GET`/`PUT /api/settings/task-retention` API requires the ARTIFEX administrator Bearer JWT; task API keys and cookie-only requests are rejected. Every save supplies all fields and the revision from the last GET. Stale edits or an active cleanup cycle return 409, so reload rather than blindly retry. `confirm_enable=true` is required for enabled saves. Values are validated before an atomic single-row write. A failed write leaves the previous policy intact; an error after commit or a lost response can still mean the policy was saved, so reload before retrying.
 
@@ -149,15 +149,15 @@ that process disables archive/retention work rather than touching another
 process's staging. Retry startup once the existing worker is idle. Runtime execution drain remains
 local to the owning backend; do not treat this as a new distributed scan engine.
 
-## Skynet/report caveat
+## Report-availability caveat for integration clients
 
 **Archival changes backend availability.** Live task/report/findings APIs do not
 serve cold packages: after archival a live lookup may return 404, and hot findings
-have moved out of live tables. Skynet is **not** assumed to have persisted a complete
+have moved out of live tables. Integration clients are **not** assumed to have persisted a complete
 report or evidence snapshot. Before enabling retention, verify that the required
 consumer has saved a complete, provenance-bearing report/evidence snapshot, or
 accept that its live report fetch will become unavailable after day 7. This change
-makes no Skynet code or preservation changes. Restoring before permanent deletion
+makes no integration-client code or preservation changes. Restoring before permanent deletion
 can recover an archive; deletion after its 30-day archive residence removes that
 recovery option (normally no earlier than about day 37 after task completion).
 

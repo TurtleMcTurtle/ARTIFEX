@@ -27,7 +27,7 @@ func integrationFixture(t *testing.T) (*Server, string) {
 func TestIntegrationIdempotentSubmission(t *testing.T) {
 	s, k := integrationFixture(t)
 	h := s.Handler()
-	body := `{"external_request_id":"skynet-fixture-1","name":"fixture","description":"inert","goal":"no network","scope":{"targets":[{"kind":"hostname","value":"example.invalid"}]}}`
+	body := `{"external_request_id":"integration-fixture-1","name":"fixture","description":"inert","goal":"no network","scope":{"targets":[{"kind":"hostname","value":"example.invalid"}]}}`
 	var wg sync.WaitGroup
 	results := make(chan *httptest.ResponseRecorder, 8)
 	for i := 0; i < 8; i++ {

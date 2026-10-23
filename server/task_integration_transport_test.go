@@ -14,10 +14,10 @@ import (
 
 // Opt-in cross-repository test: the real .NET adapter uses TLS HTTP against the
 // real ARTIFEX handlers and dedicated PostgreSQL, with runtime already cancelled.
-func TestIntegrationSkynetTransport(t *testing.T) {
-	repo := os.Getenv("SKYNET_CONTRACT_REPO")
+func TestIntegrationExternalTransport(t *testing.T) {
+	repo := os.Getenv("ARTIFEX_CONTRACT_REPO")
 	if repo == "" {
-		t.Skip("SKYNET_CONTRACT_REPO required")
+		t.Skip("ARTIFEX_CONTRACT_REPO required")
 	}
 	s, key := integrationFixture(t)
 	handler := s.Handler()
@@ -64,9 +64,9 @@ func TestIntegrationSkynetTransport(t *testing.T) {
 	cmd.Env = append(os.Environ(), "ARTIFEX_CONTRACT_URL="+ts.URL, "ARTIFEX_CONTRACT_KEY="+key, "ARTIFEX_CONTRACT_CERT="+base64.StdEncoding.EncodeToString(ts.Certificate().Raw))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("real Skynet transport: %v\n%s", err, out)
+		t.Fatalf("real external transport: %v\n%s", err, out)
 	}
-	t.Logf("real Skynet transport passed:\n%s", out)
+	t.Logf("real external transport passed:\n%s", out)
 	var tasks, mappings int
 	if err := s.m.pg.QueryRow(`SELECT count(*) FROM tasks`).Scan(&tasks); err != nil {
 		t.Fatal(err)

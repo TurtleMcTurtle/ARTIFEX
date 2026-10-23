@@ -1,6 +1,6 @@
 # Task integration API keys
 
-**Integration extensions:** see [Skynet integration contract](skynet-integration.md)
+**Integration extensions:** see [task integration contract](task-integration.md)
 for idempotent submissions, exact target metadata/asset allow rules, scoped
 findings/report reads and cancellation. The endpoint table below describes the
 original baseline; the extension contract supersedes its denied findings/control
@@ -40,7 +40,7 @@ BASE=http://127.0.0.1:8787
 # JWT_TOKEN is obtained through the existing ARTIFEX login, not an API key.
 curl -sS "$BASE/api/api-keys" \
   -H "Authorization: Bearer $JWT_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"name":"future-skynet","scopes":["tasks:read","tasks:write"],"expires_at":"2030-01-01T00:00:00Z"}'
+  -d '{"name":"integration-client","scopes":["tasks:read","tasks:write"],"expires_at":"2030-01-01T00:00:00Z"}'
 
 curl -sS "$BASE/api/api-keys" -H "Authorization: Bearer $JWT_TOKEN"
 curl -sS -X DELETE "$BASE/api/api-keys/$KEY_ID" \
@@ -97,6 +97,6 @@ ARTIFEX_PG_DSN='postgres://artifex_test@127.0.0.1:55439/artifex_test?sslmode=dis
 go build ./...
 ```
 
-No Skynet calls, remote deployment, user provisioning, per-key task isolation,
+No external client calls, remote deployment, user provisioning, per-key task isolation,
 key rotation automation, last-used audit tracking, or integration UI are included.
 Use HTTPS outside loopback, protect keys as passwords, and revoke unused keys.
